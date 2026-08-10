@@ -27,22 +27,25 @@
   });
   var AVATARS = ["\u{1F464}", "\u{1F98A}", "\u{1F42F}", "\u{1F98B}", "\u{1F981}", "\u{1F408}", "\u{1F43A}", "\u{1F9A2}"];
   var COLORS = ["#d7a74c", "#5478ad", "#b15c3d", "#7d5ab3", "#a88738", "#bb637c", "#5e6b81", "#4d8c7a"];
+  var QUICK_REACTIONS = /* @__PURE__ */ new Set(["\u{1F44D}", "\u{1F44F}", "\u{1F62E}", "\u{1F914}", "\u{1F525}", "\u{1F60E}", "\u{1F4B0}", "\u{1F440}"]);
   function cleanText(value, maxLength) {
     return String(value ?? "").replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, maxLength);
   }
   function normalizeProfile(profile = {}, seatIndex = 0) {
     const avatarIndex = Number.isInteger(profile.avatarIndex) ? Math.max(0, Math.min(AVATARS.length - 1, profile.avatarIndex)) : seatIndex % AVATARS.length;
     const requestedColor = cleanText(profile.color, 16);
+    const requestedName = cleanText(profile.name, 16);
     return {
-      name: cleanText(profile.name, 16) || `\uC218\uC9D1\uAC00 ${seatIndex + 1}`,
+      name: /^입찰자 [0-9]{4}$/.test(requestedName) ? requestedName : `\uC785\uCC30\uC790 ${String(seatIndex + 1).padStart(4, "0")}`,
       avatarIndex,
       avatar: cleanText(profile.avatar, 8) || AVATARS[avatarIndex],
       color: /^#[0-9a-f]{6}$/i.test(requestedColor) ? requestedColor : COLORS[avatarIndex],
-      persona: cleanText(profile.persona, 24) || "\uC2E4\uC2DC\uAC04 \uC218\uC9D1\uAC00"
+      persona: "\uC2E4\uC2DC\uAC04 \uC218\uC9D1\uAC00"
     };
   }
   function normalizeChatMessage(value) {
-    return cleanText(value, 160);
+    const reaction = cleanText(value, 8);
+    return QUICK_REACTIONS.has(reaction) ? reaction : "";
   }
   function validateCommand(raw) {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
@@ -279,7 +282,10 @@
     soldMs: 4e3,
     reconnectGraceMs: 25e3
   });
-  var AUTHORITY_CHECKPOINT_VERSION = 1;
+  var AUTHORITY_CHECKPOINT_VERSION = 2;
+  var RESUME_TOKEN_MAX_LENGTH = 256;
+  var SESSION_VERIFIER_PATTERN = /^[0-9a-f]{64}$/;
+  var SESSION_VERIFIER_DOMAIN = "auction8:resume-token:v1\0";
   function cloneCheckpointValue(value) {
     if (typeof structuredClone === "function") return structuredClone(value);
     return JSON.parse(JSON.stringify(value));
@@ -295,6 +301,14 @@
   }
   function assertCheckpoint(condition, message) {
     if (!condition) throw new Error(`Invalid authority checkpoint: ${message}`);
+  }
+  async function createSessionVerifier(roomCode, resumeToken) {
+    if (typeof resumeToken !== "string" || !resumeToken || resumeToken.length > RESUME_TOKEN_MAX_LENGTH) return "";
+    const subtle = globalThis.crypto?.subtle;
+    if (!subtle) throw new Error("SHA-256 session verification is unavailable");
+    const material = new TextEncoder().encode(`${SESSION_VERIFIER_DOMAIN}${roomCode}\0${resumeToken}`);
+    const digest = new Uint8Array(await subtle.digest("SHA-256", material));
+    return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
   }
   function createResumeToken() {
     const bytes = new Uint8Array(32);
@@ -376,11 +390,14 @@
         if (player.isHuman) player.online = player.id === newHostId;
       }
       room.state = state;
-      const sessionEntries = Array.isArray(checkpoint.sessions) ? checkpoint.sessions : [];
+      const sessionEntries = Array.isArray(checkpoint.sessionVerifiers) ? checkpoint.sessionVerifiers : [];
+      const seenSessionVerifiers = /* @__PURE__ */ new Set();
       for (const entry of sessionEntries) {
         assertCheckpoint(Array.isArray(entry) && entry.length === 2, "session entry is malformed");
-        const [token, playerId] = entry;
-        assertCheckpoint(typeof token === "string" && token.length > 0, "session token is malformed");
+        const [verifier, playerId] = entry;
+        assertCheckpoint(typeof verifier === "string" && SESSION_VERIFIER_PATTERN.test(verifier), "session verifier is malformed");
+        assertCheckpoint(!seenSessionVerifiers.has(verifier), "session verifier is duplicated");
+        seenSessionVerifiers.add(verifier);
         assertCheckpoint(state.players.some((player) => player.id === playerId && player.isHuman), "session player is missing");
       }
       room.sessions = new Map(cloneCheckpointValue(sessionEntries));
@@ -405,7 +422,10 @@
         capturedAt: this.now(),
         state: cloneCheckpointValue(this.state),
         catalog,
-        sessions: cloneCheckpointValue([...this.sessions.entries()]),
+        // Only one-way, room-scoped SHA-256 verifiers cross the data channel.
+        // A recipient cannot replay one as a resume token because sessionPlayer
+        // hashes every presented token before looking it up.
+        sessionVerifiers: cloneCheckpointValue([...this.sessions.entries()]),
         processedCommands: cloneCheckpointValue([...this.processedCommands.entries()])
       };
     }
@@ -415,11 +435,14 @@
     player(playerId) {
       return this.state.players.find((candidate) => candidate.id === playerId);
     }
-    registerSession(resumeToken, playerId) {
-      this.sessions.set(resumeToken, playerId);
+    async registerSession(resumeToken, playerId) {
+      const verifier = await createSessionVerifier(this.code, resumeToken);
+      if (!verifier) throw new Error("Invalid resume token");
+      this.sessions.set(verifier, playerId);
     }
-    sessionPlayer(resumeToken) {
-      return this.sessions.get(resumeToken) ?? null;
+    async sessionPlayer(resumeToken) {
+      const verifier = await createSessionVerifier(this.code, resumeToken);
+      return verifier ? this.sessions.get(verifier) ?? null : null;
     }
     addHuman(playerId, profile) {
       if (this.state.phase !== "LOBBY") return { ok: false, error: ERROR_CODES.ROOM_STARTED };
@@ -1214,7 +1237,7 @@
         onChange: () => this.onRoomChange()
       });
       this.room.state.difficulty = String(rawProfile.difficulty || "standard");
-      this.room.registerSession(this.resumeToken, this.localPlayerId);
+      await this.room.registerSession(this.resumeToken, this.localPlayerId);
       this.bindHostPeer(peer);
       const session = sessionPayload(this.room, this.localPlayerId, this.resumeToken);
       setTimeout(() => this.broadcastRoom(true), 0);
@@ -1243,12 +1266,21 @@
       });
     }
     bindIncomingConnection(connection) {
-      const record = { connection, playerId: null, authTimer: null };
+      const record = { connection, playerId: null, authenticating: false, authTimer: null };
       record.authTimer = setTimeout(() => {
         if (!record.playerId) connection.close();
       }, REQUEST_TIMEOUT_MS);
       this.hostConnections.set(connection.peer, record);
-      connection.on("data", (envelope) => this.handleHostWire(record, envelope));
+      connection.on("data", (envelope) => {
+        void this.handleHostWire(record, envelope).catch((error) => {
+          console.error("[Auction8 P2P] host request failed", error);
+          this.sendHostAck(
+            record.connection,
+            envelope?.requestId,
+            ackError("INTERNAL_ERROR", this.room?.state.revision || 0)
+          );
+        });
+      });
       connection.on("close", () => {
         clearTimeout(record.authTimer);
         if (this.hostConnections.get(connection.peer)?.connection !== connection) return;
@@ -1259,7 +1291,7 @@
         if (record.playerId) this.room?.detachSocket(record.playerId, connection.peer);
       });
     }
-    handleHostWire(record, envelope) {
+    async handleHostWire(record, envelope) {
       if (!envelope || envelope.v !== PROTOCOL_VERSION || typeof envelope.kind !== "string" || wireSize(envelope) > MAX_WIRE_BYTES) {
         return this.sendHostAck(record.connection, envelope?.requestId, ackError("BAD_REQUEST", this.room?.state.revision || 0));
       }
@@ -1270,15 +1302,19 @@
       }
       this.sendHostAck(record.connection, envelope.requestId, ackError("BAD_REQUEST", this.room?.state.revision || 0));
     }
-    handleJoinRequest(record, envelope) {
+    async handleJoinRequest(record, envelope) {
       if (!this.room || cleanRoomCode(envelope.payload?.roomCode) !== this.roomCode) {
         return this.sendHostAck(record.connection, envelope.requestId, { ok: false, error: "ROOM_NOT_FOUND" });
       }
-      const requestedToken = String(envelope.payload?.resumeToken || "");
-      let playerId = requestedToken ? this.room.sessionPlayer(requestedToken) : null;
+      if (record.playerId || record.authenticating) {
+        return this.sendHostAck(record.connection, envelope.requestId, { ok: false, error: "ALREADY_IN_ROOM" });
+      }
+      record.authenticating = true;
+      const requestedToken = String(envelope.payload?.resumeToken || "").slice(0, 256);
       let token = requestedToken;
       this.suspendBroadcast = true;
       try {
+        let playerId = requestedToken ? await this.room.sessionPlayer(requestedToken) : null;
         if (requestedToken && !playerId) {
           return this.sendHostAck(record.connection, envelope.requestId, { ok: false, error: "INVALID_RESUME_TOKEN" });
         }
@@ -1288,7 +1324,7 @@
           const result = this.room.addHuman(playerId, profile);
           if (!result.ok) return this.sendHostAck(record.connection, envelope.requestId, result);
           token = createResumeToken();
-          this.room.registerSession(token, playerId);
+          await this.room.registerSession(token, playerId);
         }
         const previousPeer = this.room.attachSocket(playerId, record.connection.peer);
         if (previousPeer && previousPeer !== record.connection.peer) {
@@ -1299,6 +1335,7 @@
         const session = sessionPayload(this.room, playerId, token);
         this.sendHostAck(record.connection, envelope.requestId, { ok: true, session });
       } finally {
+        record.authenticating = false;
         this.suspendBroadcast = false;
         setTimeout(() => this.broadcastRoom(true), 0);
       }
@@ -1716,7 +1753,7 @@
         this.authorityCheckpoint = null;
         this.authorityTerm = Number(room.state?.term) || saved.term + 1;
         this.authorityRevision = Number(room.state?.revision) || saved.revision;
-        if (!room.sessionPlayer(resumeToken)) room.registerSession(resumeToken, playerId);
+        if (!await room.sessionPlayer(resumeToken)) await room.registerSession(resumeToken, playerId);
         this.bindHostPeer(peer);
         this.suspendBroadcast = true;
         room.attachSocket(playerId, `host:${peer.id}`);
